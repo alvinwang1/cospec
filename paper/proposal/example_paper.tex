@@ -1,0 +1,269 @@
+%%%%%%%% Project proposal on the MLSys 2024 template %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Blind version; switch to [accepted] to show the team names below.
+\usepackage[accepted]{mlsys2024}% \usepackage[accepted]{mlsys2024}
+
+\mlsystitlerunning{Globally Coordinated Speculative Decoding}
+
+\begin{document}
+
+\twocolumn[
+\mlsystitle{Coordinated Adaptive Speculative Decoding
+for Distributed LLM Serving}
+
+\mlsyssetsymbol{equal}{*}
+
+\begin{mlsysauthorlist}
+\mlsysauthor{Alvin Wang}{cmu}
+\mlsysauthor{Arjun Shah}{cmu}
+\end{mlsysauthorlist}
+
+\mlsysaffiliation{cmu}{Carnegie Mellon University, Pittsburgh, PA, USA}
+
+\mlsyscorrespondingauthor{Alvin Wang}{alvinw2@andrew.cmu.edu}
+
+\mlsyscorrespondingauthor{Arjun Shah}{aashah2@andrew.cmu.edu}
+
+\mlsyskeywords{LLM Serving, Speculative Decoding, Expert Parallelism, Scheduling}
+
+\vskip 0.3in
+
+\begin{abstract}
+Adaptive speculative decoding is now standard inside a single serving engine. Large deployments, however, run many workers that are coupled, such as data-parallel attention ranks that advance in lockstep with expert parallelism, or verifiers that share a pool of drafters. In these
+settings, each worker optimizing its own speculation budget is not globally
+optimal, because the slowest rank sets the step time for everyone. We propose
+CoSpec, a coordinator that chooses speculation budgets for each request across all
+workers jointly, and co-designs request routing with those budgets. We will build
+CoSpec on an open-source engine and evaluate it on production-like traces against
+per-engine adaptive baselines.
+\end{abstract}
+]
+
+\printAffiliationsAndNotice{}
+
+%-------------------------------------------------------------------------------
+\section{Problem and System Challenges}
+\label{sec:problem}
+
+Speculative decoding trades extra compute for fewer sequential steps. At low
+load, verifying extra draft tokens is nearly free. At high load, every rejected
+token occupies the batch capacity that another request could have used, so a fixed draft
+length can add latency compared to plain decoding
+\cite{liu2024smartspec,cheng2026dspark}. The best budget therefore depends on both
+the request (its acceptance probability) and the system (its load).
+
+Existing adaptive schedulers answer this question for one engine. Modern
+deployments are distributed, which raises three challenges these schedulers do not address:
+
+\begin{itemize}
+\item \textbf{Lockstep coupling:} In data parallel (DP) attention and expert parallel (EP) Mixture-of-Experts
+serving, all DP ranks must finish each step together; idle ranks even run dummy
+passes \cite{anyscale2026ep}. A rank's speculation budget changes its batch size
+and step time, and the slowest rank gates the group \cite{nanocp2026}. Local
+greedy choices waste the slack on lightly loaded ranks and overload heavy ones.
+\item \textbf{Routing ignores speculation.} A request's best speculation
+budget depends on which rank it runs on. For example, a lightly loaded rank can verify many
+draft tokens cheaply, a busy one cannot. In turn, speculation changes how busy
+a rank really is, since each request may add several verification tokens per
+step. Routers today balance request counts or queue lengths and ignore this,
+and speculation schedulers take placement as given, so a high-acceptance request can land on a busy rank where it gets little budget.
+\item \textbf{Shared draft capacity.} Disaggregated drafters serving many
+verifiers \cite{vllm2026disagg,he2026nebulasd} need a policy for dividing a
+finite budget among verifiers with different acceptance and load.
+\end{itemize}
+
+Doing this efficiently is a systems problem. The coordinator must decide
+within a single decode step (a few ms), use little communication, and never break the
+lossless guarantee of speculative decoding, which forbids budget decisions that peek at future draft
+tokens \cite{cheng2026dspark}.
+
+%-------------------------------------------------------------------------------
+\section{State of the Art}
+\label{sec:sota}
+
+Table~\ref{tab:sota} summarizes the closest work
+\cite{liu2024smartspec,li2025adaserve,huang2025adaspec,wu2025tetris,chen2026faser,tran2026goodspeed}.
+Per-engine methods adapt to
+acceptance and load but assume each engine is independent. DSpark explicitly
+assumes a load balancer keeps DP ranks balanced so that throughput depends only on
+local batch size \cite{cheng2026dspark}. Distributed systems so far either use
+heuristic depth rules evaluated on a single 4-GPU node \cite{kumar2026streamserve},
+or focus on pooling mechanics rather than budget policy \cite{he2026nebulasd}, or
+target edge settings with one verifier \cite{tran2026goodspeed}.
+
+\begin{table}[t]
+\caption{Closest prior work. ``Scope'' is where budgets are decided.
+Code status is as of Sept.\ 2026; ``--'' means we did not find a public release.}
+\label{tab:sota}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lll}
+\toprule
+System & Scope & Code \\
+\midrule
+SmartSpec & 1 engine & vLLM-based \\
+AdaServe & 1 engine, per SLO & -- \\
+AdaSpec & 1 engine & public \\
+TETRIS & 1 batch & -- \\
+FASER & 1 engine & -- \\
+DSpark & 1 engine & drafter, ckpts \\
+StreamServe & per worker (heuristic) & -- \\
+NebulaSD & draft/target pools & -- \\
+GoodSpeed & 1 verifier, $N$ drafters & -- \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+Open building blocks we can reuse: vLLM and SGLang (SD with EAGLE-3 and MTP,
+DP+EP deployment), public EAGLE-3 drafters, and DeepSpec checkpoints and training
+code \cite{cheng2026dspark}.
+
+%-------------------------------------------------------------------------------
+\section{Proposed Directions}
+\label{sec:directions}
+
+Each direction listed below addresses one of the challenges and gaps in current SOTA schedulers. The first direction is to determine the global budget allocation in lockstep ranks. Each rank $r$ has candidate draft tokens with survival probabilities $a_{r,j}$
+and a profiled step-time model $T_r(B_r, \mathrm{KV}_r)$. Because the group step
+time is $\max_r T_r$, we maximize the total expected accepted tokens divided by
+$\max_r T_r$. A greedy ``water-filling'' allocator
+admits the highest-value tokens globally until any rank's step time would rise,
+so lightly loaded ranks spend their slack on speculation. We will keep decisions
+non-anticipating to stay lossless, and piggyback the needed summaries
+(a few scalars per rank) on the existing DP synchronization.
+
+The second direction is to implement speculation-aware routing. Extend the decode router to score each
+rank by expected goodput after budget allocation, not just queue length,
+steering high-acceptance requests (e.g., code) toward ranks with slack.
+
+The third direction is to create a shared draft pool. We can allocate draft/verify capacity
+across $N$ verifiers sharing $M$ drafters with the same marginal-value rule.
+
+%-------------------------------------------------------------------------------
+\section{Evaluation Plan}
+\label{sec:eval}
+
+Our compute is a single NVIDIA V100, so we cannot run real lockstep DP+EP
+groups. We therefore use a trace-driven methodology. The GPU supplies
+real costs and real acceptance behavior, and a simulator replays them across
+many virtual ranks.
+
+\textbf{Measurement}: We run Qwen3-4B in fp16 with released
+EAGLE-3 and DSpark drafters \cite{cheng2026dspark}, using vLLM if it supports
+the V100 and a minimal PyTorch decode loop otherwise. We (i) profile verification
+step time $T(B,\mathrm{KV})$ across batch sizes and context lengths, and
+(ii) record, for every drafted token, the drafter's predicted confidence and
+whether the target accepted it.
+
+\textbf{Simulation:} A discrete-event simulator models $R\in\{4,8,16,64\}$
+lockstep ranks whose group step time is $\max_r T_r$, using the profiled curves
+and replaying the recorded acceptance traces. It implements routing and a
+shared draft pool.
+
+\textbf{Single-GPU validation:} We execute several virtual ranks' verification
+batches back to back on the V100, charge each group step their maximum time,
+and check that measured throughput matches the simulator's prediction. This
+also measures the allocator's per-step overhead.
+
+\textbf{Workloads:} A code-heavy mix (HumanEval, MBPP) and a chat-heavy mix
+(ShareGPT, MT-Bench) to vary acceptance; arrival times from the Azure LLM
+inference traces, with deliberately skewed rank loads.
+
+\textbf{Baselines:} No SD; fixed draft length $k=4$; per-rank adaptive
+(DSpark-style greedy on each rank); CoSpec with Direction 1 only, and with Direction 1 + Direction 2.
+
+\textbf{Metrics:} Goodput under TPOT SLOs, P50/P99 TPOT, throughput.
+
+%-------------------------------------------------------------------------------
+\section{Team and Division of Work}
+\label{sec:team}
+
+\begin{itemize}
+\item \textbf{Alvin Wang (GPU side):} setting up the decode loop on the V100,
+profiling step-time curves, collecting acceptance traces, running the
+single-GPU validation, and preparing workloads.
+\item \textbf{Arjun Shah (algorithm and simulator side):} building the lockstep
+simulator, implementing the allocator (D1), routing (D2) and shared draft
+pool (D3), and running the simulated baselines.
+\end{itemize}
+Both members share benchmarking, analysis, writing, and meet weekly to
+check the simulator against GPU measurements.
+
+
+%-------------------------------------------------------------------------------
+\section{Timeline}
+\label{sec:timeline}
+
+\begin{table}[h]
+\caption{Milestones (Oct.\ 1 -- Dec.\ 12, 2026).}
+\label{tab:timeline}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ll}
+\toprule
+Weeks & Milestone \\
+\midrule
+1--2 & Pick engine; DP+EP + SD running on small MoE \\
+3--4 & Profiling on full node; build simulator \\
+5--6 & D1 in simulator, then in engine (small MoE) \\
+7 & \emph{Midterm:} D1 vs.\ baselines, first full-node runs \\
+8--9 & D2 routing; D3 in simulator \\
+10 & Final full-node runs; simulated scaling \\
+11 & Final report and presentation \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+%-------------------------------------------------------------------------------
+\section{Infrastructure and Compute Estimate}
+\label{sec:infra}
+
+\textbf{GPU:} A single NVIDIA V100 (32\,GB preferred; 16\,GB is workable with
+smaller batches). We use it only for measurement: profiling step-time curves,
+collecting acceptance traces, and single-GPU validation. The target is
+Qwen3-4B in fp16 ($\sim$8\,GB of weights) with released EAGLE-3 and DSpark
+drafters, leaving the rest of memory for the KV cache.
+
+\textbf{CPU:} A 16+ core machine with 64\,GB RAM for the lockstep simulator,
+trace processing and analysis. The simulator needs no GPU.
+
+\textbf{Storage:} About 200\,GB: model and drafter weights ($\sim$15\,GB),
+acceptance traces and step-time profiles ($\sim$50\,GB), and logs and results.
+
+\textbf{GPU time (about 100 V100-hours):}
+\begin{itemize}
+\item Setup and debugging of the decode loop: 20 h.
+\item Profiling $T(B,\mathrm{KV})$ over batch sizes and context lengths: 15 h.
+\item Collecting acceptance traces (2 workload mixes $\times$ 2 drafters): 35 h.
+\item Single-GPU validation of the allocator against the simulator: 15 h.
+\item Reruns and buffer: 15 h.
+\end{itemize}
+
+\textbf{CPU time:} Simulated experiments (5 systems $\times$ 2 workloads
+$\times$ 4 rank counts $\times$ 3 load levels $\times$ 3 seeds $=$ 360 runs of a
+few minutes each) take roughly 50--100 core-hours. We use existing drafter
+checkpoints, so no training is required.
+
+\bibliography{example_paper}
+\bibliographystyle{mlsys2024}
+
+\end{document}

@@ -1,0 +1,22 @@
+# Environments and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Generated data and results (large; regenerate from scripts)
+data/
+results/
+figs/
+
+# LaTeX build products
+*.aux
+*.log
+*.out
+*.blg
+*.bbl
+*.synctex.gz
+
+# Original proposal archive (sources live in paper/proposal/)
+*.zip

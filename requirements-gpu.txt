@@ -1,0 +1,6 @@
+# GPU measurement scripts in gpu/ (V100: fp16, no vLLM needed)
+-r requirements-sim.txt
+torch>=2.1
+transformers>=4.51  # first release with Qwen3
+datasets>=2.18
+huggingface_hub>=0.20

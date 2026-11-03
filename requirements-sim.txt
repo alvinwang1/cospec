@@ -1,0 +1,4 @@
+# Simulator, experiments and tests (CPU only)
+numpy>=1.24
+matplotlib>=3.7
+pytest>=7
