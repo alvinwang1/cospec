@@ -14,6 +14,7 @@ because prefill produces the first token.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -40,8 +41,11 @@ class TraceSet:
         return np.diff(self.offsets)
 
     def save(self, path: str) -> None:
+        """Write atomically: a run killed mid-save leaves the previous file intact."""
+        path = os.fspath(path)
+        tmp = path + ".tmp.npz"   # ends in .npz so numpy doesn't append another suffix
         np.savez_compressed(
-            path,
+            tmp,
             conf=self.conf.astype(np.float16),
             acc_len=self.acc_len.astype(np.int16),
             offsets=self.offsets.astype(np.int64),
@@ -49,6 +53,7 @@ class TraceSet:
             category=self.category.astype(str),
             meta=np.array(json.dumps(self.meta)),
         )
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path: str) -> "TraceSet":

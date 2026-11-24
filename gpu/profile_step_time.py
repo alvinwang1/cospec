@@ -9,39 +9,72 @@ Writes a CSV the simulator's cost model is fit from:
 Rows with kind=verify time one target forward of q tokens per sequence over
 ctx cached tokens. Rows with kind=draft time one drafter step (q=1), which is
 the per-depth drafting cost.
+
+Steps are timed as CUDA graphs by default (--timing graph), as serving engines run decode, so
+the profile measures GPU work rather than Python and kernel-launch overhead; --timing eager
+times plain Hugging Face forwards.
+
+Every measurement is appended as it finishes, so rerunning the same command
+resumes where it stopped (--fresh starts over). Configs that ran out of memory
+are listed in <out>.oom and not retried.
 """
 from __future__ import annotations
 
 import argparse
-import csv
-import os
 
 import torch
 
-from common import cuda_time_ms, load_model, verify_forward, zero_cache
+from checkpoint import Progress, open_csv_checkpoint
+from common import GraphedStep, cuda_time_ms, load_model, verify_forward, zero_cache
+
+FIELDS = ["kind", "n_seqs", "q", "ctx", "n_tokens", "kv_tokens", "ms", "ms_p90"]
+OOM_FIELDS = ["kind", "n_seqs", "q", "ctx"]
 
 
 def ints(s):
     return [int(x) for x in s.split(",")]
 
 
-def profile(model, kind, batches, qs, ctxs, max_kv, iters, writer, fh):
+def key(kind, B, q, ctx):
+    return (kind, int(B), int(q), int(ctx))
+
+
+def grid(kind, batches, qs, ctxs, max_kv):
+    return [key(kind, B, q, ctx) for ctx in ctxs for B in batches if B * ctx <= max_kv for q in qs]
+
+
+def profile(model, kind, batches, qs, ctxs, max_kv, iters, out, oom, done, prog, timing):
+    (w, fh), (ow, ofh) = out, oom
     for ctx in ctxs:
         for B in batches:
             if B * ctx > max_kv:
                 continue
+            todo = [q for q in qs if key(kind, B, q, ctx) not in done]
+            if not todo:
+                continue
+            cache = None
             try:
-                cache = zero_cache(model, B, ctx)
-                for q in qs:
-                    med, p90 = cuda_time_ms(lambda: verify_forward(model, cache, B, ctx, q), iters=iters)
-                    row = dict(kind=kind, n_seqs=B, q=q, ctx=ctx, n_tokens=B * q, kv_tokens=B * ctx,
-                               ms=round(med, 4), ms_p90=round(p90, 4))
-                    writer.writerow(row)
+                if timing == "graph":
+                    cache = GraphedStep(model, B, ctx)
+                else:
+                    cache = zero_cache(model, B, ctx)
+                while todo:
+                    q = todo[0]
+                    if timing == "graph":
+                        med, p90 = cache.time_ms(q, iters=iters)
+                    else:
+                        med, p90 = cuda_time_ms(lambda: verify_forward(model, cache, B, ctx, q), iters=iters)
+                    w.writerow(dict(kind=kind, n_seqs=B, q=q, ctx=ctx, n_tokens=B * q, kv_tokens=B * ctx,
+                                    ms=round(med, 4), ms_p90=round(p90, 4)))
                     fh.flush()
-                    print(row, flush=True)
-                del cache
+                    todo.pop(0)
+                    prog.step(f"{kind} B={B} q={q} ctx={ctx}: {med:.2f} ms")
             except torch.cuda.OutOfMemoryError:
-                print(f"OOM at {kind} B={B} ctx={ctx}; skipping")
+                for q in todo:
+                    ow.writerow(dict(kind=kind, n_seqs=B, q=q, ctx=ctx))
+                ofh.flush()
+                prog.step(f"{kind} B={B} ctx={ctx}: out of memory, skipping q={todo}", n=len(todo))
+            del cache
             torch.cuda.empty_cache()
 
 
@@ -56,21 +89,37 @@ def main():
                     help="skip B*ctx above this (KV for Qwen3-4B fp16 is ~144 KB/token)")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--fresh", action="store_true", help="discard an existing --out and start over")
+    ap.add_argument("--attn", default="cospec_sdpa", choices=["cospec_sdpa", "cospec_sdpa_nocausal", "sdpa"],
+                    help="attention kernel path (see gpu/common.py _engine_sdpa)")
+    ap.add_argument("--timing", choices=["graph", "eager"], default="graph",
+                    help="time CUDA-graph replays (like a serving engine) or eager forwards")
     args = ap.parse_args()
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    fields = ["kind", "n_seqs", "q", "ctx", "n_tokens", "kv_tokens", "ms", "ms_p90"]
-    with open(args.out, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields)
-        w.writeheader()
-        _, model = load_model(args.model)
-        print(f"{torch.cuda.get_device_name()}  {args.model}  layers={model.config.num_hidden_layers}")
-        profile(model, "verify", args.batch, args.q, args.ctx, args.max_kv_tokens, args.iters, w, fh)
-        if args.drafter:
-            del model
-            torch.cuda.empty_cache()
-            _, drafter = load_model(args.drafter)
-            profile(drafter, "draft", args.batch, [1], args.ctx, args.max_kv_tokens * 4, args.iters, w, fh)
+    rows, fh, w = open_csv_checkpoint(args.out, FIELDS, FIELDS, args.fresh)
+    oom_rows, ofh, ow = open_csv_checkpoint(args.out + ".oom", OOM_FIELDS, OOM_FIELDS, args.fresh)
+    done = {key(r["kind"], r["n_seqs"], r["q"], r["ctx"]) for r in rows + oom_rows}
+
+    stages = [("verify", args.model, args.q, args.max_kv_tokens)]
+    if args.drafter:
+        stages.append(("draft", args.drafter, [1], args.max_kv_tokens * 4))
+    jobs = {kind: grid(kind, args.batch, qs, args.ctx, max_kv) for kind, _, qs, max_kv in stages}
+    prog = Progress(sum(map(len, jobs.values())), "profile", sum(k in done for j in jobs.values() for k in j))
+    prog.start()
+
+    for kind, name, qs, max_kv in stages:
+        if all(k in done for k in jobs[kind]):
+            print(f"{kind} ({name}): already profiled")
+            continue
+        _, model = load_model(name, attn=args.attn)
+        print(f"{torch.cuda.get_device_name()}  {name}  layers={model.config.num_hidden_layers}", flush=True)
+        profile(model, kind, args.batch, qs, args.ctx, max_kv, args.iters, (w, fh), (ow, ofh), done, prog,
+                args.timing)
+        del model
+        torch.cuda.empty_cache()
+    fh.close()
+    ofh.close()
+    print(f"profile complete: {args.out}")
 
 
 if __name__ == "__main__":

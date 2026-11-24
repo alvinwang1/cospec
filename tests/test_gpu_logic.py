@@ -76,3 +76,30 @@ def test_zero_cache_verify_and_crop(models):
     cache = zero_cache(target, batch=3, ctx=20)
     verify_forward(target, cache, 3, 20, q=5)
     assert cache.get_seq_length() == 20
+
+
+@pytest.mark.parametrize("q", [1, 4])
+def test_engine_attention_matches_hf_on_cached_prefix(models, q):
+    """cospec_sdpa (bottom-right causal, GQA in the kernel) gives HF sdpa's verification logits."""
+    import copy
+
+    from transformers import DynamicCache
+
+    from common import register_attention
+    register_attention()
+    target, _ = models
+    torch.manual_seed(1)
+    ids = torch.randint(0, 64, (2, 30 + q))
+    target.set_attn_implementation("sdpa")
+    cache = DynamicCache()
+    with torch.no_grad():
+        target(input_ids=ids[:, :30], past_key_values=cache, use_cache=True)
+    pos = torch.arange(30, 30 + q)
+    out = {}
+    for attn in ("sdpa", "cospec_sdpa"):
+        target.set_attn_implementation(attn)
+        with torch.no_grad():
+            out[attn] = target(input_ids=ids[:, 30:], past_key_values=copy.deepcopy(cache),
+                               position_ids=pos.expand(2, -1), cache_position=pos, use_cache=True).logits
+    target.set_attn_implementation("sdpa")
+    assert torch.allclose(out["sdpa"], out["cospec_sdpa"], atol=1e-4)

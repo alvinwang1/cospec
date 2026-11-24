@@ -11,9 +11,39 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 
-def load_model(name: str, device: str = "cuda", dtype=torch.float16):
+def _engine_sdpa(module, query, key, value, attention_mask, dropout=0.0, scaling=None, causal=True, **kwargs):
+    """Attention the way a serving engine runs verification, for timing.
+
+    Hugging Face's sdpa path builds an explicit mask whenever a cache is present and copies
+    each KV head once per query head (GQA), which makes attention over a long cache many times
+    slower than an engine's flash/paged kernels. Here the cache holds exactly the attended tokens,
+    so the q new tokens see all of it plus each other causally: a bottom-right causal mask, with
+    GQA handled inside the kernel.
+    """
+    import torch.nn.functional as F
+    from torch.nn.attention.bias import causal_lower_right
+    q_len, k_len = query.shape[2], key.shape[2]
+    mask = causal_lower_right(q_len, k_len) if causal and q_len > 1 else None
+    out = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=scaling, enable_gqa=True)
+    return out.transpose(1, 2).contiguous(), None
+
+
+def _engine_sdpa_nocausal(*args, **kwargs):
+    """Timing-only variant: the q new tokens also see each other's future (wrong outputs, same cost)."""
+    return _engine_sdpa(*args, causal=False, **kwargs)
+
+
+def register_attention():
+    from transformers import AttentionInterface
+    AttentionInterface.register("cospec_sdpa", _engine_sdpa)
+    AttentionInterface.register("cospec_sdpa_nocausal", _engine_sdpa_nocausal)
+
+
+def load_model(name: str, device: str = "cuda", dtype=torch.float16, attn: str = "sdpa"):
+    """attn: "sdpa" (Hugging Face's), or "cospec_sdpa" / "cospec_sdpa_nocausal" (see _engine_sdpa)."""
+    register_attention()
     tok = AutoTokenizer.from_pretrained(name)
-    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype, attn_implementation="sdpa")
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, attn_implementation=attn)
     return tok, model.to(device).eval()
 
 
@@ -56,6 +86,58 @@ def verify_forward(model, cache: DynamicCache, batch: int, ctx: int, q: int):
     model(input_ids=ids, past_key_values=cache, position_ids=pos.expand(batch, q),
           cache_position=pos, use_cache=True)
     crop_cache(cache, ctx)
+
+
+class GraphedStep:
+    """Verification (or draft) steps of one (batch, ctx) shape, captured as CUDA graphs.
+
+    Serving engines run decode steps as CUDA graphs, so a step costs only its GPU work. Eager
+    Hugging Face forwards add tens of ms of Python and kernel-launch overhead per step, which
+    would swamp the batch-size dependence the cost model is about. A StaticCache holds exactly
+    ctx cached tokens (zeros: values don't change the cost) plus the q new ones, so attention
+    spans ctx + q, as in an engine. Each graph first resets the cache's fill level to ctx, so
+    replays don't advance it. Changing q re-captures (a few ms).
+    """
+
+    def __init__(self, model, batch: int, ctx: int):
+        self.model, self.batch, self.ctx = model, batch, ctx
+        self.q = self.g = self.cache = self.inputs = None
+
+    def _forward(self, ids, pos):
+        for layer in self.cache.layers:
+            layer.cumulative_length.fill_(self.ctx)
+        return self.model(input_ids=ids, past_key_values=self.cache, position_ids=pos.expand(self.batch, -1),
+                          cache_position=pos, use_cache=True).logits
+
+    @torch.inference_mode()
+    def graph(self, q: int) -> torch.cuda.CUDAGraph:
+        if q != self.q:
+            from transformers import StaticCache
+            self.q = self.g = self.cache = self.inputs = None      # free the previous shape first
+            self.cache = StaticCache(config=self.model.config, max_cache_len=self.ctx + q)
+            dev = self.model.device
+            ids = torch.randint(0, self.model.config.vocab_size, (self.batch, q), device=dev)
+            pos = torch.arange(self.ctx, self.ctx + q, device=dev)
+            side = torch.cuda.Stream()            # warm up (and allocate the cache) off the capture stream
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    self._forward(ids, pos)
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                logits = self._forward(ids, pos)
+            self.q, self.g, self.inputs = q, g, (ids, pos, logits)   # static buffers live with the graph
+        return self.g
+
+    def logits(self, q: int) -> torch.Tensor:
+        """Replay once and return the graph's output buffer (for correctness checks)."""
+        self.graph(q).replay()
+        torch.cuda.synchronize()
+        return self.inputs[2]
+
+    def time_ms(self, q: int, warmup: int = 3, iters: int = 10) -> tuple[float, float]:
+        return cuda_time_ms(self.graph(q).replay, warmup=warmup, iters=iters)
 
 
 def cuda_time_ms(fn, warmup: int = 3, iters: int = 10) -> tuple[float, float]:

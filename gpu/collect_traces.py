@@ -9,7 +9,8 @@ exactly in the simulator, so the GPU never has to rerun per policy.
   python gpu/collect_traces.py --prompts data/prompts/code.jsonl \
       --out data/traces/code_qwen3-0.6b.npz --K 8 --max-new-tokens 512
 
-Saves every --save-every prompts and resumes from an existing --out.
+Checkpoints every --save-every prompts or --save-minutes minutes (and on interrupt);
+rerunning the same command resumes from the existing --out.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import time
 import numpy as np
 import torch
 
+from checkpoint import Progress
 from common import CachedLM, chat_ids, eos_ids, greedy_draft, load_model
 from sd_decode import speculative_generate
 
@@ -62,23 +64,33 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--max-prompt-tokens", type=int, default=2048)
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--save-every", type=int, default=10)
+    ap.add_argument("--save-every", type=int, default=10, help="checkpoint after this many prompts")
+    ap.add_argument("--save-minutes", type=float, default=5.0, help="... or after this many minutes")
     args = ap.parse_args()
 
     with open(args.prompts) as f:
         prompts = [json.loads(line) for line in f if line.strip()]
     prompts = prompts[: args.limit]
 
-    confs, accs, lens, plens, cats, ids = [], [], [], [], [], []
+    confs, accs, lens, plens, cats, ids, skipped = [], [], [], [], [], [], []
     if os.path.exists(args.out):
         prev = TraceSet.load(args.out)
         if prev.K != args.K:
             sys.exit(f"{args.out} has K={prev.K}, asked for K={args.K}")
+        if prev.meta.get("max_new_tokens", args.max_new_tokens) != args.max_new_tokens:
+            sys.exit(f"{args.out} was collected with --max-new-tokens {prev.meta['max_new_tokens']}; "
+                     f"use the same value to resume, or a new --out")
         confs, accs = [prev.conf], [prev.acc_len]
         lens, plens, cats = list(prev.output_lens()), list(prev.prompt_len), list(prev.category)
         ids = list(prev.meta.get("ids", []))
-        print(f"resuming after {len(ids)} prompts")
-    done = set(ids)
+        skipped = list(prev.meta.get("skipped", []))
+    done = set(ids) | set(skipped)
+
+    prog = Progress(len(prompts), f"traces {os.path.basename(args.out)}", sum(p["id"] in done for p in prompts))
+    prog.start()
+    if prog.done == prog.total:
+        print(f"nothing to do: {args.out} is complete")
+        return
 
     tok, target = load_model(args.target)
     _, drafter = load_model(args.drafter)
@@ -90,36 +102,42 @@ def main():
             acc_len=np.concatenate(accs) if accs else np.zeros(0, np.int16),
             offsets=np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
             prompt_len=np.array(plens, dtype=np.int32), category=np.array(cats, dtype=str),
-            meta=dict(target=args.target, drafter=args.drafter, K=args.K, ids=ids,
+            meta=dict(target=args.target, drafter=args.drafter, K=args.K, ids=ids, skipped=skipped,
                       max_new_tokens=args.max_new_tokens, decoding="greedy"),
         )
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         ts.save(args.out)
+        print(f"checkpoint: {len(ids)} requests saved to {args.out}", flush=True)
 
-    t_start, n_new = time.time(), 0
-    for item in prompts:
-        if item["id"] in done:
-            continue
-        p_ids = chat_ids(tok, item["prompt"], args.max_prompt_tokens)
-        y, _ = speculative_generate(target, drafter, p_ids, args.max_new_tokens, 4, eos)
-        if len(y) < 2:
-            continue
-        conf, acc = position_drafts(drafter, p_ids, y, args.K)
-        confs.append(conf)
-        accs.append(acc)
-        lens.append(len(y))
-        plens.append(len(p_ids))
-        cats.append(item["category"])
-        ids.append(item["id"])
-        n_new += 1
-        el = time.time() - t_start
-        print(f"[{len(ids)}] {item['id']}: prompt={len(p_ids)} out={len(y)} "
-              f"mean_acc={acc[1:].mean():.2f}/{args.K}  ({el / n_new:.1f}s/prompt)", flush=True)
-        if n_new % args.save_every == 0:
+    last_save, unsaved = time.time(), 0
+    try:
+        for item in prompts:
+            if item["id"] in done:
+                continue
+            p_ids = chat_ids(tok, item["prompt"], args.max_prompt_tokens)
+            y, _ = speculative_generate(target, drafter, p_ids, args.max_new_tokens, 4, eos)
+            if len(y) < 2:
+                skipped.append(item["id"])   # recorded so a resume doesn't redo it
+                unsaved += 1
+                prog.step(f"{item['id']}: empty output, skipped")
+                continue
+            conf, acc = position_drafts(drafter, p_ids, y, args.K)
+            confs.append(conf)
+            accs.append(acc)
+            lens.append(len(y))
+            plens.append(len(p_ids))
+            cats.append(item["category"])
+            ids.append(item["id"])
+            unsaved += 1
+            prog.step(f"{item['id']}: prompt={len(p_ids)} out={len(y)} mean_acc={acc[1:].mean():.2f}/{args.K}")
+            if unsaved >= args.save_every or time.time() - last_save >= 60 * args.save_minutes:
+                save()
+                last_save, unsaved = time.time(), 0
+    finally:
+        # Also runs on an interrupt (Colab's stop button), so finished prompts are kept.
+        if unsaved:
             save()
-    save()
-    print(f"saved {len(ids)} requests to {args.out}")
-
+    print(f"done: {len(ids)} requests in {args.out}")
 
 if __name__ == "__main__":
     main()

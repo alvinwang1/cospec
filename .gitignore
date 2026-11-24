@@ -20,3 +20,4 @@ figs/
 
 # Original proposal archive (sources live in paper/proposal/)
 *.zip
+modal_out/
